@@ -10,12 +10,12 @@ type Bindings = {
 };
 
 type AuthedCtx = {
-  uid: string; // Firebase UID など
+  uid: string;
 };
 
 const router = new Hono<{ Bindings: Bindings; Variables: AuthedCtx }>();
 
-// --- schema helpers (auto-migration) ---
+// --- schema helpers ---
 async function hasColumn(db: D1Database, table: string, column: string): Promise<boolean> {
   const rs = await db.prepare(`PRAGMA table_info(${table})`).all();
   const rows = (rs.results ?? []) as Array<any>;
@@ -24,7 +24,8 @@ async function hasColumn(db: D1Database, table: string, column: string): Promise
 
 async function ensureTimetableSchema(c: any) {
   const db = dbTimetable(c);
-  // create tables if not exist
+  
+  // 設定テーブル
   await db.prepare(`
     CREATE TABLE IF NOT EXISTS timetable_settings (
       user_id TEXT PRIMARY KEY,
@@ -32,58 +33,66 @@ async function ensureTimetableSchema(c: any) {
       allow_copy INTEGER NOT NULL DEFAULT 0,
       allow_followers INTEGER NOT NULL DEFAULT 1,
       custom_colors TEXT,
+      current_year INTEGER,
+      current_semester INTEGER,
+      current_sub_term INTEGER,
+      is_term_mode INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER
     )
   `).run();
 
+  // エントリーテーブル（年度・学期・サブタームを削除し、最新のみ保持）
   await db.prepare(`
-    CREATE TABLE IF NOT EXISTS timetable_entries (
+    CREATE TABLE IF NOT EXISTS timetable_entries_latest (
       user_id TEXT NOT NULL,
-      year INTEGER NOT NULL,
-      semester INTEGER NOT NULL,
-      sub_term INTEGER NOT NULL DEFAULT 0,
       day INTEGER NOT NULL,
       period INTEGER NOT NULL,
       course_code TEXT,
       course_name TEXT,
       instructor TEXT,
       updated_at INTEGER,
-      PRIMARY KEY(user_id, year, semester, sub_term, day, period)
+      PRIMARY KEY(user_id, day, period)
     )
   `).run();
 
-  // add missing columns lazily (backfill for older DBs)
-  if (!(await hasColumn(db, 'timetable_settings', 'allow_copy'))) {
-    await db.prepare(`ALTER TABLE timetable_settings ADD COLUMN allow_copy INTEGER NOT NULL DEFAULT 0`).run();
-  }
-  if (!(await hasColumn(db, 'timetable_settings', 'allow_followers'))) {
-    await db.prepare(`ALTER TABLE timetable_settings ADD COLUMN allow_followers INTEGER NOT NULL DEFAULT 1`).run();
-  }
-  if (!(await hasColumn(db, 'timetable_settings', 'custom_colors'))) {
-    await db.prepare(`ALTER TABLE timetable_settings ADD COLUMN custom_colors TEXT`).run();
-  }
-  if (!(await hasColumn(db, 'timetable_settings', 'updated_at'))) {
-    await db.prepare(`ALTER TABLE timetable_settings ADD COLUMN updated_at INTEGER`).run();
+  // 旧テーブルからのマイグレーション（必要に応じて）
+  const oldTableExists = await db
+    .prepare(`SELECT name FROM sqlite_master WHERE name = 'timetable_entries' LIMIT 1`)
+    .first();
+    
+  if (oldTableExists) {
+    console.log('[migration] Migrating from old timetable_entries to timetable_entries_latest');
+    // 最新の学期データのみを移行
+    await db.prepare(`
+      INSERT OR IGNORE INTO timetable_entries_latest (user_id, day, period, course_code, course_name, instructor, updated_at)
+      SELECT DISTINCT user_id, day, period, course_code, course_name, instructor, updated_at
+      FROM timetable_entries
+      WHERE (user_id, year, semester, sub_term, updated_at) IN (
+        SELECT user_id, year, semester, sub_term, MAX(updated_at)
+        FROM timetable_entries
+        GROUP BY user_id
+      )
+    `).run();
   }
 }
 
-// ensure schema for all timetable endpoints
-router.use('/timetables/*', async (c, next) => { await ensureTimetableSchema(c); return next(); });
+router.use('/timetables/*', async (c, next) => { 
+  await ensureTimetableSchema(c); 
+  return next(); 
+});
 
-// Ping first (must be before ":userId" route)
 router.get('/timetables/__ping', (c) => c.json({ ok: true }));
 
 // DB resolvers
 function dbTimetable(c: any) {
   return (c.env as any).TIMETABLE_DB ?? (c.env as any).FOLLOW_DB;
 }
+
 function dbSocial(c: any) {
   return (c.env as any).FOLLOW_DB ?? (c.env as any).TIMETABLE_DB;
 }
 
-// ────────────────────────────────────────
-// JWT 検証（Authorization: Bearer <token>）
-// ────────────────────────────────────────
+// JWT認証
 const auth = async (c: any, next: any) => {
   const authz = c.req.header('Authorization') || '';
   const token = authz.startsWith('Bearer ') ? authz.slice(7) : null;
@@ -98,7 +107,6 @@ const auth = async (c: any, next: any) => {
       issuer: iss,
       audience: aud,
     });
-    // Firebase: uid は payload.user_id or sub に入る
     const uid = (payload as any).user_id || (payload as any).sub;
     if (!uid) throw new Error('No uid in token');
     c.set('uid', uid);
@@ -108,22 +116,14 @@ const auth = async (c: any, next: any) => {
   }
 };
 
-// ────────────────────────────────────────
-// ユーティリティ：day 変換
-// ────────────────────────────────────────
+// day変換ユーティリティ
 const dayKeyToNum = (k: string | number): number => {
-  // 数値が直接渡された場合はそのまま返す
   if (typeof k === 'number') return k;
-  
   const map: Record<string, number> = { m:1, t:2, w:3, r:4, f:5 };
   const key = k.toString().toLowerCase();
-  
   if (map[key] != null) return map[key];
-  
-  // 数値文字列の場合
   const num = parseInt(key, 10);
   if (!isNaN(num) && num >= 1 && num <= 5) return num;
-  
   throw new HTTPException(400, { message: `bad day: ${k}` });
 };
 
@@ -133,27 +133,22 @@ const dayNumToKey = (n: number) => {
   return map[n];
 };
 
-// ────────────────────────────────────────
-// helper: userId (path) → UID 解決（users.id または users.user_id を許容）
-// ────────────────────────────────────────
+// UID解決
 async function resolveUid(c: any, userParam: string): Promise<string> {
   if (!userParam) return userParam;
-  // 先頭の @ を許容し、user_id は大文字小文字を無視して照合
   const q = userParam.startsWith('@') ? userParam.slice(1) : userParam;
   try {
     const row = (await dbSocial(c)
       .prepare('SELECT id FROM users WHERE id = ?1 OR LOWER(user_id) = LOWER(?1) LIMIT 1')
       .bind(q)
       .first()) as { id?: string } | null;
-    return row?.id ?? q; // 見つからなければそのまま（既にUIDの可能性）
+    return row?.id ?? q;
   } catch {
     return q;
   }
 }
 
-// ────────────────────────────────────────
-// helper: フォロー関係の確認
-// ────────────────────────────────────────
+// フォロー関係確認
 async function isFollower(c: any, viewerId: string, ownerId: string): Promise<boolean> {
   if (!viewerId || !ownerId) return false;
   const row = await dbSocial(c)
@@ -165,53 +160,41 @@ async function isFollower(c: any, viewerId: string, ownerId: string): Promise<bo
 
 // ────────────────────────────────────────
 // GET /timetables/:userId
-// クエリ: year, semester, subTerm
-// レスポンス: { entries: [...], settings: {...} }
+// 最新の時間割を取得（年度・学期情報は設定から参照）
 // ────────────────────────────────────────
 router.get('/timetables/:userId', async (c) => {
   const url = new URL(c.req.url);
-  const debugMode = url.searchParams.get('debug') === '1' || c.req.header('x-debug') === '1';
-
   const userParam = c.req.param('userId');
   const ownerUid = await resolveUid(c, userParam);
+  
+  // クエリパラメータは互換性のため受け取るが使用しない
   const year = Number(url.searchParams.get('year') ?? '2025');
   const semester = Number(url.searchParams.get('semester') ?? '1');
   const subTerm = Number(url.searchParams.get('subTerm') ?? '0');
 
   let viewer: string | null = null;
-  if (debugMode) {
-    try { await auth(c, async () => {}); viewer = c.get('uid'); } catch {}
-  }
 
-  // 設定取得（allow_followers が無い古いDBも許容）
+  // 設定取得
   const tdb = dbTimetable(c);
-  let settingsRow: any = null;
-  let hasAllowFollowersCol = true;
-  try {
-    settingsRow = await tdb
-      .prepare('SELECT is_public, allow_copy, allow_followers, custom_colors FROM timetable_settings WHERE user_id = ?')
-      .bind(ownerUid)
-      .first();
-  } catch (e: any) {
-    const msg = String(e || '');
-    if (msg.includes('no such column: allow_followers')) {
-      hasAllowFollowersCol = false;
-      settingsRow = await tdb
-        .prepare('SELECT is_public, allow_copy, custom_colors FROM timetable_settings WHERE user_id = ?')
-        .bind(ownerUid)
-        .first();
-    } else {
-      throw e;
-    }
-  }
+  const settingsRow = await tdb
+    .prepare(`SELECT is_public, allow_copy, allow_followers, custom_colors, 
+              current_year, current_semester, current_sub_term, is_term_mode 
+              FROM timetable_settings WHERE user_id = ?`)
+    .bind(ownerUid)
+    .first() as any;
 
   const isPublic = settingsRow?.is_public === 1;
   const allowCopy = settingsRow?.allow_copy === 1;
-  const allowFollowers = hasAllowFollowersCol ? settingsRow?.allow_followers === 1 : false; // 古いDBでは既定 false
+  const allowFollowers = settingsRow?.allow_followers === 1;
   const customColors = settingsRow?.custom_colors ? JSON.parse(settingsRow.custom_colors) : null;
+  
+  // 現在の学期情報（表示用）
+  const currentYear = settingsRow?.current_year ?? year;
+  const currentSemester = settingsRow?.current_semester ?? semester;
+  const currentSubTerm = settingsRow?.current_sub_term ?? subTerm;
+  const isTermMode = settingsRow?.is_term_mode === 1;
 
-  // 非公開のときは、本人 or (フォロワー & allow_followers=1) のみ許可
-  let okFollower: boolean | null = null;
+  // アクセス権限チェック
   if (!isPublic) {
     try {
       await auth(c, async () => {});
@@ -223,98 +206,109 @@ router.get('/timetables/:userId', async (c) => {
       if (!allowFollowers) {
         throw new HTTPException(403, { message: 'Timetable is private' });
       }
-      okFollower = await isFollower(c, viewer, ownerUid);
+      const okFollower = await isFollower(c, viewer, ownerUid);
       if (!okFollower) {
         throw new HTTPException(403, { message: 'Timetable is private' });
       }
     }
   }
 
-  // entries 取得
-  const { results } = await dbTimetable(c)
-    .prepare(
-      `SELECT day, period, course_code, course_name, instructor, sub_term
-       FROM timetable_entries
-       WHERE user_id = ? AND year = ? AND semester = ? AND sub_term = ? 
-       ORDER BY day, period`
-    )
-    .bind(ownerUid, year, semester, subTerm)
-    .all();
+  // 最新の時間割エントリー取得
+  try {
+    const { results } = await dbTimetable(c)
+      .prepare(
+        `SELECT day, period, course_code, course_name, instructor
+         FROM timetable_entries_latest
+         WHERE user_id = ? 
+         ORDER BY day, period`
+      )
+      .bind(ownerUid)
+      .all();
 
-  const rows = (results ?? []) as Array<{ 
-    day: number; 
-    period: number; 
-    course_code: string | null; 
-    course_name: string | null; 
-    instructor: string | null; 
-    sub_term: number 
-  }>;
-  
-  const entries = rows.map((r) => ({
-    // 基本フィールド
-    sub_term: r.sub_term ?? 0,
-    subTerm: r.sub_term ?? 0,        // キャメルケース版も追加 
-    day: dayNumToKey(r.day),         // 文字列 ('m', 't', 'w', 'r', 'f')
-    dayNum: r.day,                   // 数値 (1-5)
-    period: r.period,
+    const rows = (results ?? []) as Array<{ 
+      day: number; 
+      period: number; 
+      course_code: string | null; 
+      course_name: string | null; 
+      instructor: string | null;
+    }>;
     
-    // コースコード（両方の形式で提供）
-    course_code: r.course_code ?? '',     // スネークケース（後方互換）
-    courseCode: r.course_code ?? '',      // キャメルケース（推奨）
-    
-    // コース名（両方の形式で提供）
-    course_name: r.course_name ?? '',     // スネークケース（後方互換）
-    courseName: r.course_name ?? '',      // キャメルケース（推奨）
-    
-    // 講師名
-    instructor: r.instructor ?? '',
-  }));
+    const entries = rows.map((r) => ({
+      // 互換性のため学期情報を含める
+      year: currentYear,
+      semester: currentSemester,
+      sub_term: currentSubTerm,
+      subTerm: currentSubTerm,
+      
+      // 基本情報
+      day: dayNumToKey(r.day),
+      dayNum: r.day,
+      period: r.period,
+      
+      // コース情報（両形式で提供）
+      course_code: r.course_code ?? '',
+      courseCode: r.course_code ?? '',
+      course_name: r.course_name ?? '',
+      courseName: r.course_name ?? '',
+      instructor: r.instructor ?? '',
+    }));
 
-  if (debugMode) {
-    console.log('[TT DEBUG]', {
-      userParam, ownerUid, viewerUid: viewer,
-      isPublic, allowFollowers, okFollower,
-      settingsRowExists: !!settingsRow, entriesCount: entries.length,
-      year, semester, subTerm,
+    return c.json({
+      entries,
+      items: entries,
+      settings: {
+        is_public: isPublic,
+        allow_copy: allowCopy,
+        allow_followers: allowFollowers,
+        custom_colors: customColors,
+        current_year: currentYear,
+        current_semester: currentSemester,
+        current_sub_term: currentSubTerm,
+        is_term_mode: isTermMode,
+      },
+    });
+  } catch (e) {
+    console.error('[GET /timetables/:userId] Error fetching entries:', e);
+    
+    // エラー時は空の配列を返す（エラーを投げない）
+    return c.json({
+      entries: [],
+      items: [],
+      settings: {
+        is_public: isPublic,
+        allow_copy: allowCopy,
+        allow_followers: allowFollowers,
+        custom_colors: customColors,
+        current_year: currentYear,
+        current_semester: currentSemester,
+        current_sub_term: currentSubTerm,
+        is_term_mode: isTermMode,
+      },
     });
   }
-
-  return c.json({
-    entries,
-    items: entries, // 互換キー（旧フロント想定）
-    settings: {
-      is_public: isPublic,
-      allow_copy: allowCopy,
-      allow_followers: allowFollowers,
-      custom_colors: customColors,
-    },
-    ...(debugMode ? { __debug: {
-      userParam, ownerUid, viewerUid: viewer,
-      isPublic, allowFollowers, isFollower: okFollower,
-      settingsRowExists: !!settingsRow, entriesCount: entries.length,
-      year, semester, subTerm,
-    }} : {}),
-  });
 });
 
 // ────────────────────────────────────────
-// PUT /timetables/sync   （認証必須）
-// 完全同期エンドポイント：指定された学期のデータを完全に置き換える
-// ボディ: { year, semester, subTerm, entries: [...] }
+// PUT /timetables/sync （認証必須）
+// 完全同期：現在の時間割を完全に置き換える
 // ────────────────────────────────────────
 router.put('/timetables/sync', auth, async (c) => {
   const uid = c.get('uid');
   const body = await c.req.json<{ 
-    year: number;
-    semester: number;
+    year?: number;
+    semester?: number;
     subTerm?: number;
     sub_term?: number;
+    isTermMode?: boolean;
     entries: any[] 
   }>();
   
-  const year = Number(body.year);
-  const semester = Number(body.semester);
+  // 学期情報（設定保存用）
+  const year = Number(body.year ?? 2025);
+  const semester = Number(body.semester ?? 1);
   const subTerm = Number(body.subTerm ?? body.sub_term ?? 0);
+  const isTermMode = body.isTermMode ?? false;
+  
   const entries = body?.entries ?? [];
   
   if (!Array.isArray(entries)) {
@@ -323,61 +317,67 @@ router.put('/timetables/sync', auth, async (c) => {
 
   const tdb = dbTimetable(c);
   
-  console.log('[PUT /timetables/sync] Full sync for:', { uid, year, semester, subTerm });
-  console.log('[PUT /timetables/sync] Entries count:', entries.length);
+  console.log('[PUT /timetables/sync] Full sync for:', { uid, entriesCount: entries.length });
   
-  // トランザクション的に処理
   try {
-    // 1. 既存のエントリーを全て削除
+    // 1. 既存の全エントリーを削除
     await tdb.prepare(
-      `DELETE FROM timetable_entries 
-       WHERE user_id = ? AND year = ? AND semester = ? AND sub_term = ?`
-    ).bind(uid, year, semester, subTerm).run();
+      `DELETE FROM timetable_entries_latest WHERE user_id = ?`
+    ).bind(uid).run();
     
-    console.log('[PUT /timetables/sync] Deleted existing entries');
+    console.log('[PUT /timetables/sync] Deleted all existing entries');
     
-    // 2. 新しいエントリーを挿入（空の場合はスキップ）
+    // 2. 新しいエントリーを挿入
     if (entries.length > 0) {
       const stmts = entries.map((e) => {
-        // 両方のフィールド名に対応
-        const entryYear = Number(e.year ?? year);
-        const entrySemester = Number(e.semester ?? semester);
-        const entrySubTerm = Number(e.subTerm ?? e.sub_term ?? subTerm);
-        
-        // dayが文字列または数値の両方に対応
         const dayValue = e.day ?? e.dayNum;
         let day: number;
         try {
           day = dayKeyToNum(dayValue);
         } catch (err) {
-          console.error('[PUT /timetables/sync] Invalid day value:', dayValue, 'in entry:', e);
+          console.error('[PUT /timetables/sync] Invalid day value:', dayValue);
           throw err;
         }
         
         const period = Number(e.period);
-        
-        // 両方のフィールド名に対応
         const courseCode = e.courseCode ?? e.course_code ?? null;
         const courseName = e.courseName ?? e.course_name ?? null;
         const instructor = e.instructor ?? null;
 
         return tdb
           .prepare(
-            `INSERT INTO timetable_entries (user_id, year, semester, sub_term, day, period, course_code, course_name, instructor, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))`
+            `INSERT INTO timetable_entries_latest (user_id, day, period, course_code, course_name, instructor, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, strftime('%s','now'))`
           )
-          .bind(uid, entryYear, entrySemester, entrySubTerm, day, period, courseCode, courseName, instructor);
+          .bind(uid, day, period, courseCode, courseName, instructor);
       });
 
       const results = await tdb.batch(stmts);
       console.log('[PUT /timetables/sync] Inserted new entries:', results.length);
     }
     
+    // 3. 現在の学期情報を設定に保存
+    const settingsExist = await tdb
+      .prepare('SELECT user_id FROM timetable_settings WHERE user_id = ?')
+      .bind(uid)
+      .first();
+
+    if (!settingsExist) {
+      await tdb.prepare(
+        `INSERT INTO timetable_settings (user_id, current_year, current_semester, current_sub_term, is_term_mode, updated_at)
+         VALUES (?, ?, ?, ?, ?, strftime('%s','now'))`
+      ).bind(uid, year, semester, subTerm, isTermMode ? 1 : 0).run();
+    } else {
+      await tdb.prepare(
+        `UPDATE timetable_settings 
+         SET current_year = ?, current_semester = ?, current_sub_term = ?, is_term_mode = ?, updated_at = strftime('%s','now')
+         WHERE user_id = ?`
+      ).bind(year, semester, subTerm, isTermMode ? 1 : 0, uid).run();
+    }
+    
     return c.json({ 
       success: true, 
-      deleted: true,
-      inserted: entries.length,
-      message: `Synced ${entries.length} entries for ${year}年度 学期${semester} サブターム${subTerm}`
+      message: `Synced ${entries.length} entries as latest timetable`
     });
     
   } catch (err) {
@@ -387,130 +387,16 @@ router.put('/timetables/sync', auth, async (c) => {
 });
 
 // ────────────────────────────────────────
-// POST /timetables   （認証必須）
-// ボディ: { entries: [{ year, semester, subTerm, day, period, courseCode, courseName, instructor }] }
-// 既存と同一キー(ユーザー,年,学期,subTerm,day,period)はUPSERT
-// ────────────────────────────────────────
-router.post('/timetables', auth, async (c) => {
-  const uid = c.get('uid');
-  const body = await c.req.json<{ entries: any[] }>();
-  const entries = body?.entries ?? [];
-  
-  if (!Array.isArray(entries) || entries.length === 0) {
-    throw new HTTPException(400, { message: 'entries required' });
-  }
-
-  const tdb = dbTimetable(c);
-  
-  // デバッグログ
-  console.log('[POST /timetables] Received entries:', entries.length);
-  console.log('[POST /timetables] First entry:', entries[0]);
-  
-  const stmts = entries.map((e) => {
-    const year = Number(e.year);
-    const semester = Number(e.semester);
-    // 両方のフィールド名に対応
-    const subTerm = Number(e.subTerm ?? e.sub_term ?? 0);
-    
-    // dayが文字列または数値の両方に対応
-    const dayValue = e.day ?? e.dayNum;
-    let day: number;
-    try {
-      day = dayKeyToNum(dayValue);
-    } catch (err) {
-      console.error('[POST /timetables] Invalid day value:', dayValue, 'in entry:', e);
-      throw err;
-    }
-    
-    const period = Number(e.period);
-    
-    // 両方のフィールド名に対応
-    const courseCode = e.courseCode ?? e.course_code ?? null;
-    const courseName = e.courseName ?? e.course_name ?? null;
-    const instructor = e.instructor ?? null;
-
-    console.log('[POST /timetables] Processing entry:', {
-      uid, year, semester, subTerm, day, period, courseCode, courseName
-    });
-
-    return tdb
-      .prepare(
-        `INSERT INTO timetable_entries (user_id, year, semester, sub_term, day, period, course_code, course_name, instructor, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))
-         ON CONFLICT(user_id, year, semester, sub_term, day, period) DO UPDATE SET
-           course_code = excluded.course_code,
-           course_name = excluded.course_name,
-           instructor = excluded.instructor,
-           updated_at = excluded.updated_at`
-      )
-      .bind(uid, year, semester, subTerm, day, period, courseCode, courseName, instructor);
-  });
-
-  try {
-    const results = await tdb.batch(stmts);
-    console.log('[POST /timetables] Batch update successful:', results.length);
-    return c.json({ success: true, upserted: entries.length });
-  } catch (err) {
-    console.error('[POST /timetables] Batch update failed:', err);
-    throw err;
-  }
-});
-
-// ────────────────────────────────────────
-// DELETE /timetables  （認証必須）
-// ボディ: { year, semester, subTerm, day, period }
-// ────────────────────────────────────────
-router.delete('/timetables', auth, async (c) => {
-  const uid = c.get('uid');
-  const body = await c.req.json<{ 
-    year: number; 
-    semester: number; 
-    subTerm?: number;
-    sub_term?: number;
-    day: string | number; 
-    period: number;
-  }>();
-  
-  const year = Number(body.year);
-  const semester = Number(body.semester);
-  const subTerm = Number(body.subTerm ?? body.sub_term ?? 0);
-  
-  let day: number;
-  try {
-    day = dayKeyToNum(body.day);
-  } catch (err) {
-    console.error('[DELETE /timetables] Invalid day value:', body.day);
-    throw err;
-  }
-  
-  const period = Number(body.period);
-
-  const tdb = dbTimetable(c);
-  
-  console.log('[DELETE /timetables] Deleting entry:', {
-    uid, year, semester, subTerm, day, period
-  });
-  
-  await tdb.prepare(
-    `DELETE FROM timetable_entries 
-     WHERE user_id = ? AND year = ? AND semester = ? AND sub_term = ? AND day = ? AND period = ?`
-  ).bind(uid, year, semester, subTerm, day, period).run();
-
-  return c.json({ success: true });
-});
-
-// ────────────────────────────────────────
 // PUT /timetables/settings （認証必須）
-// ボディ: { isPublic?: boolean, allowCopy?: boolean, customColors?: object }
 // ────────────────────────────────────────
 router.put('/timetables/settings', auth, async (c) => {
   const uid = c.get('uid');
   const b = await c.req.json();
+  
   const isPublic = typeof b.isPublic === 'boolean' ? (b.isPublic ? 1 : 0) : null;
   const allowCopy = typeof b.allowCopy === 'boolean' ? (b.allowCopy ? 1 : 0) : null;
   const allowFollowers = typeof b.allowFollowers === 'boolean' ? (b.allowFollowers ? 1 : 0) : null;
   
-  // customColorsの処理を修正
   let customColors: string | null = null;
   if (b.customColors !== undefined) {
     if (b.customColors === null) {
@@ -522,7 +408,6 @@ router.put('/timetables/settings', auth, async (c) => {
     }
   }
   
-  // 既存 row 有無
   const tdb = dbTimetable(c);
   const exist = await tdb
     .prepare('SELECT user_id FROM timetable_settings WHERE user_id = ?')
@@ -557,88 +442,29 @@ router.put('/timetables/settings', auth, async (c) => {
   return c.json({ success: true });
 });
 
-// GET /timetables/settings  （認証必須）
-// 応答: { is_public, allow_copy, allow_followers, custom_colors }
+// ────────────────────────────────────────
+// GET /timetables/settings （認証必須）
+// ────────────────────────────────────────
 router.get('/timetables/settings', auth, async (c) => {
   const uid = c.get('uid');
   const tdb = dbTimetable(c);
-  const row = (await tdb
-    .prepare('SELECT is_public, allow_copy, allow_followers, custom_colors FROM timetable_settings WHERE user_id = ?')
+  const row = await tdb
+    .prepare(`SELECT is_public, allow_copy, allow_followers, custom_colors,
+              current_year, current_semester, current_sub_term, is_term_mode
+              FROM timetable_settings WHERE user_id = ?`)
     .bind(uid)
-    .first()) as { is_public?: number; allow_copy?: number; allow_followers?: number; custom_colors?: string | null } | null;
+    .first() as any;
+    
   return c.json({
     is_public: row?.is_public === 1,
     allow_copy: row?.allow_copy === 1,
     allow_followers: row?.allow_followers === 1,
     custom_colors: row?.custom_colors ? JSON.parse(row.custom_colors) : null,
+    current_year: row?.current_year ?? 2025,
+    current_semester: row?.current_semester ?? 1,
+    current_sub_term: row?.current_sub_term ?? 0,
+    is_term_mode: row?.is_term_mode === 1,
   });
-});
-
-// ────────────────────────────────────────
-// POST /timetables/copy/:sourceUserId （認証必須）
-// ボディ: { year, semester, subTerm }
-// 条件: source の is_public=1 && allow_copy=1 でないと 403
-// 処理: 自分の同一学期データを削除 → source を丸ごとコピー
-//      custom_colors も一緒にコピーしておくとUX良い
-// ────────────────────────────────────────
-router.post('/timetables/copy/:sourceUserId', auth, async (c) => {
-  const sourceUserIdParam = c.req.param('sourceUserId');
-  const sourceUserId = await resolveUid(c, sourceUserIdParam);
-  const uid = c.get('uid');
-  const b = await c.req.json();
-  const year = Number(b.year);
-  const semester = Number(b.semester);
-  const subTerm = Number(b.subTerm ?? 0);
-
-  // 権限確認
-  const tdb = dbTimetable(c);
-  const settings = (await tdb
-    .prepare('SELECT is_public, allow_copy, custom_colors FROM timetable_settings WHERE user_id = ?')
-    .bind(sourceUserId)
-    .first()) as { is_public?: number; allow_copy?: number; custom_colors?: string | null } | null;
-
-  if (!settings || settings.is_public !== 1 || settings.allow_copy !== 1) {
-    throw new HTTPException(403, { message: 'Copy not allowed' });
-  }
-
-  // 自分の該当学期データを削除
-  await tdb
-    .prepare('DELETE FROM timetable_entries WHERE user_id = ? AND year = ? AND semester = ? AND sub_term = ?')
-    .bind(uid, year, semester, subTerm)
-    .run();
-
-  // source の entries を取得
-  const { results } = await tdb
-    .prepare(
-      `SELECT day, period, course_code, course_name, instructor
-       FROM timetable_entries
-       WHERE user_id = ? AND year = ? AND semester = ? AND sub_term = ?
-       ORDER BY day, period`
-    )
-    .bind(sourceUserId, year, semester, subTerm)
-    .all();
-
-  const srcRows = (results ?? []) as Array<{ day: number; period: number; course_code: string | null; course_name: string | null; instructor: string | null }>;
-  // バルク挿入
-  const stmts = srcRows.map((r) =>
-    tdb.prepare(
-      `INSERT INTO timetable_entries (user_id, year, semester, sub_term, day, period, course_code, course_name, instructor, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))`
-    ).bind(uid, year, semester, subTerm, r.day, r.period, r.course_code, r.course_name, r.instructor)
-  );
-  if (stmts.length) await tdb.batch(stmts);
-
-  // custom_colors もコピー（任意）
-  await tdb
-    .prepare(
-      `INSERT INTO timetable_settings (user_id, is_public, allow_copy, custom_colors, updated_at)
-       VALUES (?, 0, 0, ?, strftime('%s','now'))
-       ON CONFLICT(user_id) DO UPDATE SET custom_colors = excluded.custom_colors, updated_at = excluded.updated_at`
-    )
-    .bind(uid, settings.custom_colors ?? null)
-    .run();
-
-  return c.json({ success: true, copied: stmts.length });
 });
 
 export default router;
